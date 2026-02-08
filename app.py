@@ -173,33 +173,42 @@ if st.session_state.query_engine:
     with col1:
         # The Main Extraction Button
         if st.button("🚀 Run Full Data Extraction"):
-            user_input = "Extract the full project parameters." # Placeholder for UI logic
-            search_query = json_structure_prompt
-            
-            # Add to history (visual only)
+            # 1. VISUAL FEEDBACK
             st.session_state.messages.append({"role": "user", "content": "Running Full Data Extraction..."})
             with st.chat_message("user"):
                 st.write("Running Full Data Extraction...")
 
-            # Generate
+            # 2. THE FIX: Create a specialized engine just for this heavy task
+            # We increase 'similarity_top_k' to 20 to catch distributed data
+            # We use 'response_mode="tree_summarize"' to force it to combine all 20 chunks intelligently
+            extraction_engine = st.session_state.query_engine.index.as_query_engine(
+                system_prompt=json_structure_prompt,
+                similarity_top_k=20,     # <--- INCREASED from 7 to 20
+                response_mode="tree_summarize" # <--- NEW: Combines multiple chunks better
+            )
+
+            # 3. GENERATE
             with st.chat_message("assistant"):
-                with st.spinner("Extracting & Formatting Data..."):
-                    response = st.session_state.query_engine.query(search_query)
+                with st.spinner("Scanning 20+ key sections of the report... (This may take 30s)"):
+                    
+                    # We send a very specific trigger phrase to matched the system prompt
+                    response = extraction_engine.query("Extract all project parameters into the defined JSON schema.")
                     response_text = str(response)
                     
-                    # Parse JSON
+                    # 4. PARSE & DISPLAY
                     df = extract_and_normalize_json(response_text)
                     
                     if df is not None:
                         st.session_state.last_data = df
-                        st.success("Extraction Complete!")
-                        st.dataframe(df) # Show the table
+                        st.success("Extraction Complete! (Checked 20 document segments)")
+                        st.dataframe(df)
                         
-                        # Save raw JSON text to history just in case
-                        st.session_state.messages.append({"role": "assistant", "content": "Data Extracted Successfully (See Download)"})
+                        # Add success message to chat history
+                        st.session_state.messages.append({"role": "assistant", "content": "Data Extracted Successfully. See the Download section below."})
                     else:
-                        st.error("Could not parse JSON. Raw output below:")
-                        st.text(response_text)
+                        st.error("Extraction failed or returned invalid JSON.")
+                        with st.expander("See Raw Output"):
+                            st.text(response_text)
 
     # Chat Input (for other questions)
     if prompt := st.chat_input("Ask specific questions (e.g. 'What is the strip ratio?')"):
