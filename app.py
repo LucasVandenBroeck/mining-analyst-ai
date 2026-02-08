@@ -26,34 +26,32 @@ with st.sidebar:
     st.divider()
     
     model_choice = st.selectbox("Select Model", ["gpt-4o", "gpt-4o-mini"])
-    st.info("Tip: GPT-4o is recommended for complex table reasoning.")
+    st.info("Tip: GPT-4o is highly recommended for structured JSON extraction.")
 
-# --- HELPER FUNCTION: EXTRACT JSON ---
-def extract_json(text):
+# --- HELPER FUNCTION: EXTRACT & FLATTEN JSON ---
+def extract_and_normalize_json(text):
     """
-    Tries to find JSON data inside the AI's response.
-    Returns a pandas DataFrame or None if it fails.
+    Finds JSON in text, loads it, and flattens nested dictionaries 
+    so they fit nicely into Excel columns.
     """
     try:
-        # Find JSON block between triple backticks if present
+        # 1. Regex to find the JSON block
         match = re.search(r"```json\n(.*?)\n```", text, re.DOTALL)
-        if match:
-            json_str = match.group(1)
-        else:
-            # If no backticks, try to parse the whole text
-            json_str = text
-            
+        json_str = match.group(1) if match else text
+        
+        # 2. Parse JSON
         data = json.loads(json_str)
         
-        # If it's a list of dictionaries (standard table format)
-        if isinstance(data, list):
-            return pd.DataFrame(data)
-        # If it's a single dictionary
-        elif isinstance(data, dict):
-            return pd.DataFrame([data])
-        else:
-            return None
+        # 3. Ensure it's a list (even if one item) for normalization
+        if isinstance(data, dict):
+            data = [data]
+            
+        # 4. Normalize (Flatten nested keys like 'price.Au')
+        df = pd.json_normalize(data)
+        return df
+        
     except Exception as e:
+        print(f"JSON Error: {e}")
         return None
 
 # --- MAIN LOGIC ---
@@ -71,12 +69,13 @@ Settings.llm = llm
 # --- FILE UPLOAD ---
 uploaded_file = st.file_uploader("Upload Mining Report (PDF)", type=['pdf'])
 
+# Session State Initialization
 if "query_engine" not in st.session_state:
     st.session_state.query_engine = None
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "last_data" not in st.session_state:
-    st.session_state.last_data = None # Store the last extracted table
+    st.session_state.last_data = None
 
 if uploaded_file:
     # Check if new file
@@ -93,15 +92,15 @@ if uploaded_file:
                 documents = SimpleDirectoryReader(input_files=[tmp_file_path], file_extractor=file_extractor).load_data()
                 index = VectorStoreIndex.from_documents(documents)
 
-                mining_prompt = (
-                    "You are a Mining Analyst. "
-                    "If asked to 'extract data for Excel', output ONLY valid JSON without extra text. "
-                    "Format the JSON as a list of dictionaries, where each dictionary is a row."
+                # Base Prompt
+                base_prompt = (
+                    "You are a Mining Analyst. Your goal is to extract structured data. "
+                    "Always answer based strictly on the provided text."
                 )
                 
                 st.session_state.query_engine = index.as_query_engine(
-                    system_prompt=mining_prompt,
-                    similarity_top_k=5
+                    system_prompt=base_prompt,
+                    similarity_top_k=7  # Increased context window for full report scanning
                 )
                 
                 st.session_state.last_uploaded = uploaded_file.name
@@ -114,87 +113,119 @@ if uploaded_file:
 # --- CHAT & EXPORT INTERFACE ---
 if st.session_state.query_engine:
 
-    # 1. Display History
+    # Display History
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # 2. Input Area
+    # --- THE GOLDEN PROMPT TEMPLATE ---
+    # We define the schema here to inject into the query
+    json_structure_prompt = """
+    Extract the project data into the following JSON schema.
+    Return ONLY valid JSON inside ```json``` tags.
+    If a value is not found, use null.
+    
+    Mapping Guide:
+    - res_t: Resource Tonnage (Total M&I preferred)
+    - res_grade: Resource Grades (e.g., {"Au": 1.5, "Ag": 20})
+    - rev_t: Reserve Tonnage (Proven & Probable)
+    - mining: Mining Method (Open Pit, Underground, etc.)
+    - rec: Recovery Rates % (e.g., {"Au": 92.5})
+    - prod_pa: Production Per Annum (Avg LOM)
+    - capex: In Millions (initial and sustaining)
+    - opex: Per tonne processed
+    - price: Metal prices used in economic model
+    
+    Target JSON Structure:
+    {
+      "proj": "Project Name",
+      "co": "Company Name",
+      "loc": "Country/Location",
+      "dep_type": "Deposit Type (e.g. Porphyry)",
+      "res_t": null,
+      "res_grade": {},
+      "res_contained": {},
+      "rev_t": null,
+      "rev_grade": {},
+      "rev_contained": {},
+      "cutoff": null,
+      "mining": "",
+      "strip": null,
+      "tpd": null,
+      "tpy": null,
+      "rec": {},
+      "proc_method": "",
+      "prod_pa": {},
+      "capex_init": null,
+      "capex_sus": null,
+      "opex_mining_t": null,
+      "opex_proc_t": null,
+      "opex_ga_t": null,
+      "price": {},
+      "discount": null,
+      "mine_life_yr": null
+    }
+    """
+
+    # Input Area
     col1, col2 = st.columns([3, 1])
     
-    # Preset Buttons
     with col1:
-        st.write("Targeted Extraction:")
-        btn_eco = st.button("📊 Extract Economics to Excel")
-        btn_drill = st.button("💎 Extract Drill Results to Excel")
-    
-    # Chat Input
-    prompt = st.chat_input("Ask a question...")
+        # The Main Extraction Button
+        if st.button("🚀 Run Full Data Extraction"):
+            user_input = "Extract the full project parameters." # Placeholder for UI logic
+            search_query = json_structure_prompt
+            
+            # Add to history (visual only)
+            st.session_state.messages.append({"role": "user", "content": "Running Full Data Extraction..."})
+            with st.chat_message("user"):
+                st.write("Running Full Data Extraction...")
 
-    # Logic
-    search_query = None
-    is_export_task = False
-
-    if btn_eco:
-        search_query = (
-            "Extract the Project Economics into a JSON table. "
-            "Columns: Metric (e.g., NPV 5%, IRR, Initial Capex, AISC), Unit, Value, Notes. "
-            "Do not add conversational text, just the JSON."
-        )
-        is_export_task = True
-    elif btn_drill:
-        search_query = (
-            "Extract the top 10 drill intercepts into a JSON table. "
-            "Columns: Hole_ID, From_m, To_m, Interval_m, Grade_Au_gpt, Grade_Ag_gpt. "
-            "Do not add conversational text, just the JSON."
-        )
-        is_export_task = True
-    elif prompt:
-        search_query = prompt
-
-    # Execution
-    if search_query:
-        # Append user message to history
-        st.session_state.messages.append({"role": "user", "content": search_query})
-        with st.chat_message("user"):
-            st.markdown(search_query)
-
-        # Generate Response
-        with st.chat_message("assistant"):
-            with st.spinner("Analyzing..."):
-                response = st.session_state.query_engine.query(search_query)
-                response_text = str(response)
-                
-                # Check if this was an export task
-                if is_export_task:
-                    df = extract_json(response_text)
+            # Generate
+            with st.chat_message("assistant"):
+                with st.spinner("Extracting & Formatting Data..."):
+                    response = st.session_state.query_engine.query(search_query)
+                    response_text = str(response)
+                    
+                    # Parse JSON
+                    df = extract_and_normalize_json(response_text)
+                    
                     if df is not None:
-                        st.session_state.last_data = df # Save for download button
-                        st.dataframe(df) # Show preview
-                        st.success("Data extracted! Use the download button below.")
+                        st.session_state.last_data = df
+                        st.success("Extraction Complete!")
+                        st.dataframe(df) # Show the table
+                        
+                        # Save raw JSON text to history just in case
+                        st.session_state.messages.append({"role": "assistant", "content": "Data Extracted Successfully (See Download)"})
                     else:
-                        st.warning("Could not format data as JSON. Showing raw text instead.")
-                        st.markdown(response_text)
-                else:
-                    st.markdown(response_text)
-                
-                st.session_state.messages.append({"role": "assistant", "content": response_text})
+                        st.error("Could not parse JSON. Raw output below:")
+                        st.text(response_text)
 
-    # 3. Persistent Download Button
-    # This button appears whenever there is valid data in the 'buffer'
+    # Chat Input (for other questions)
+    if prompt := st.chat_input("Ask specific questions (e.g. 'What is the strip ratio?')"):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                response = st.session_state.query_engine.query(prompt)
+                st.markdown(str(response))
+                st.session_state.messages.append({"role": "assistant", "content": str(response)})
+
+    # Persistent Download Button
     if st.session_state.last_data is not None:
         st.divider()
-        st.subheader("📥 Download Area")
+        st.subheader("📥 Export")
         
-        # Convert DataFrame to Excel in memory
         output = BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            st.session_state.last_data.to_excel(writer, index=False, sheet_name='Mining_Data')
+            st.session_state.last_data.to_excel(writer, index=False, sheet_name='Summary')
         excel_data = output.getvalue()
 
         st.download_button(
-            label="Download Data as Excel (.xlsx)",
+            label="Download Excel (.xlsx)",
             data=excel_data,
-            file_name="mining_analysis.xlsx",
+            file_name="mining_data_export.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
