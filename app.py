@@ -26,33 +26,17 @@ with st.sidebar:
     st.divider()
     
     model_choice = st.selectbox("Select Model", ["gpt-4o", "gpt-4o-mini"])
-    st.info("Tip: GPT-4o is highly recommended for structured JSON extraction.")
+    st.info("Tip: GPT-4o is CRITICAL for this multi-step reasoning.")
 
-# --- HELPER FUNCTION: EXTRACT & FLATTEN JSON ---
-def extract_and_normalize_json(text):
-    """
-    Finds JSON in text, loads it, and flattens nested dictionaries 
-    so they fit nicely into Excel columns.
-    """
+# --- HELPER: MERGE JSON ---
+def extract_json_from_text(text):
+    """Extracts JSON block from text."""
+    match = re.search(r"```json\n(.*?)\n```", text, re.DOTALL)
+    json_str = match.group(1) if match else text
     try:
-        # 1. Regex to find the JSON block
-        match = re.search(r"```json\n(.*?)\n```", text, re.DOTALL)
-        json_str = match.group(1) if match else text
-        
-        # 2. Parse JSON
-        data = json.loads(json_str)
-        
-        # 3. Ensure it's a list (even if one item) for normalization
-        if isinstance(data, dict):
-            data = [data]
-            
-        # 4. Normalize (Flatten nested keys like 'price.Au')
-        df = pd.json_normalize(data)
-        return df
-        
-    except Exception as e:
-        # print(f"JSON Error: {e}") # Debugging
-        return None
+        return json.loads(json_str)
+    except:
+        return {}
 
 # --- MAIN LOGIC ---
 
@@ -69,9 +53,8 @@ Settings.llm = llm
 # --- FILE UPLOAD ---
 uploaded_file = st.file_uploader("Upload Mining Report (PDF)", type=['pdf'])
 
-# Session State Initialization
 if "index" not in st.session_state:
-    st.session_state.index = None  # <--- FIX 1: Initialize index storage
+    st.session_state.index = None
 if "query_engine" not in st.session_state:
     st.session_state.query_engine = None
 if "messages" not in st.session_state:
@@ -80,35 +63,28 @@ if "last_data" not in st.session_state:
     st.session_state.last_data = None
 
 if uploaded_file:
-    # Check if new file
     if "last_uploaded" not in st.session_state or st.session_state.last_uploaded != uploaded_file.name:
-        
-        with st.spinner(f"Parsing {uploaded_file.name}... (This happens only once per file)"):
+        with st.spinner(f"Parsing {uploaded_file.name}..."):
             try:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
                     tmp_file.write(uploaded_file.read())
                     tmp_file_path = tmp_file.name
 
-                parser = LlamaParse(result_type="markdown", verbose=True, language="en")
+                # LlamaParse with improved instruction
+                parser = LlamaParse(
+                    result_type="markdown", 
+                    verbose=True, 
+                    language="en",
+                    parsing_instruction="This is a mining report. Extract tables containing Drill Results, Reserves, and Economics precisely."
+                )
                 file_extractor = {".pdf": parser}
                 documents = SimpleDirectoryReader(input_files=[tmp_file_path], file_extractor=file_extractor).load_data()
                 
-                # Create Index
                 index = VectorStoreIndex.from_documents(documents)
-                
-                # <--- FIX 2: Store the Index itself, not just the engine
                 st.session_state.index = index
-
-                # Create the standard Chat Engine (Lightweight)
-                base_prompt = (
-                    "You are a Mining Analyst. Your goal is to extract structured data. "
-                    "Always answer based strictly on the provided text."
-                )
                 
-                st.session_state.query_engine = index.as_query_engine(
-                    system_prompt=base_prompt,
-                    similarity_top_k=5
-                )
+                # Default Chat Engine
+                st.session_state.query_engine = index.as_query_engine(similarity_top_k=5)
                 
                 st.session_state.last_uploaded = uploaded_file.name
                 st.success("Analysis Ready!")
@@ -117,103 +93,79 @@ if uploaded_file:
             except Exception as e:
                 st.error(f"Error: {e}")
 
-# --- CHAT & EXPORT INTERFACE ---
-if st.session_state.index: # Check if index exists
+# --- INTERFACE ---
+if st.session_state.index:
 
-    # Display History
+    # History
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # --- THE GOLDEN PROMPT TEMPLATE ---
-    json_structure_prompt = """
-    Extract the project data into the following JSON schema.
-    Return ONLY valid JSON inside ```json``` tags.
-    If a value is not found, use null.
+    # --- DEFINING THE 3 TARGETED SCHEMAS ---
     
-    Mapping Guide:
-    - res_t: Resource Tonnage (Total M&I preferred)
-    - res_grade: Resource Grades (e.g., {"Au": 1.5, "Ag": 20})
-    - rev_t: Reserve Tonnage (Proven & Probable)
-    - mining: Mining Method (Open Pit, Underground, etc.)
-    - rec: Recovery Rates % (e.g., {"Au": 92.5})
-    - prod_pa: Production Per Annum (Avg LOM)
-    - capex: In Millions (initial and sustaining)
-    - opex: Per tonne processed
-    - price: Metal prices used in economic model
+    # 1. General Info
+    prompt_general = """
+    Extract General Project Info. Return JSON:
+    { "proj": "Project Name", "co": "Company", "loc": "Location", "dep_type": "Deposit Type", "mining": "Method", "mine_life_yr": null }
+    """
     
-    Target JSON Structure:
-    {
-      "proj": "Project Name",
-      "co": "Company Name",
-      "loc": "Country/Location",
-      "dep_type": "Deposit Type (e.g. Porphyry)",
-      "res_t": null,
-      "res_grade": {},
-      "res_contained": {},
-      "rev_t": null,
-      "rev_grade": {},
-      "rev_contained": {},
-      "cutoff": null,
-      "mining": "",
-      "strip": null,
-      "tpd": null,
-      "tpy": null,
-      "rec": {},
-      "proc_method": "",
-      "prod_pa": {},
-      "capex_init": null,
-      "capex_sus": null,
-      "opex_mining_t": null,
-      "opex_proc_t": null,
-      "opex_ga_t": null,
-      "price": {},
-      "discount": null,
-      "mine_life_yr": null
-    }
+    # 2. Resources (The hard part)
+    prompt_geo = """
+    Extract Resource & Reserve Estimates. Return JSON:
+    { "res_t": "Total Resource Tonnes", "res_grade": {"Au": null, "Cu": null}, "rev_t": "Total Reserve Tonnes", "rev_grade": {"Au": null} }
+    """
+    
+    # 3. Economics
+    prompt_eco = """
+    Extract Economic metrics (Base Case). Return JSON:
+    { "capex_init": "Initial Capex", "capex_sus": "Sustaining Capex", "opex_mining_t": "Mining cost per tonne", "price": {"Au": null}, "npv": null, "irr": null }
     """
 
-    # Input Area
     col1, col2 = st.columns([3, 1])
     
     with col1:
-        # The Main Extraction Button
-        if st.button("🚀 Run Full Data Extraction"):
-            st.session_state.messages.append({"role": "user", "content": "Running Full Data Extraction..."})
+        if st.button("🚀 Run Deep Extraction (Divide & Conquer)"):
+            st.session_state.messages.append({"role": "user", "content": "Running Deep Extraction..."})
             with st.chat_message("user"):
-                st.write("Running Full Data Extraction...")
+                st.write("Running Deep Extraction...")
 
-            # <--- FIX 3: Use the stored INDEX to create a new heavy-duty engine
-            # This logic now works because st.session_state.index is valid
+            # Create specific engine
             extraction_engine = st.session_state.index.as_query_engine(
-                similarity_top_k=20,     # Deep search
-                response_mode="tree_summarize" # Summarize all chunks
+                similarity_top_k=10, 
+                response_mode="tree_summarize"
             )
 
-            with st.chat_message("assistant"):
-                with st.spinner("Scanning 20+ key sections of the report... (This may take 30s)"):
-                    
-                    # We send a very specific trigger phrase combined with the schema
-                    query_text = f"Extract all project parameters. {json_structure_prompt}"
-                    
-                    response = extraction_engine.query(query_text)
-                    response_text = str(response)
-                    
-                    df = extract_and_normalize_json(response_text)
-                    
-                    if df is not None:
-                        st.session_state.last_data = df
-                        st.success("Extraction Complete! (Checked 20 document segments)")
-                        st.dataframe(df)
-                        
-                        st.session_state.messages.append({"role": "assistant", "content": "Data Extracted Successfully. See the Download section below."})
-                    else:
-                        st.error("Extraction failed or returned invalid JSON.")
-                        with st.expander("See Raw Output"):
-                            st.text(response_text)
+            final_data = {}
 
-    # Chat Input (for other questions)
-    if prompt := st.chat_input("Ask specific questions (e.g. 'What is the strip ratio?')"):
+            with st.chat_message("assistant"):
+                # STEP 1: General
+                with st.spinner("1/3 Extracting General Info..."):
+                    res1 = extraction_engine.query(prompt_general)
+                    final_data.update(extract_json_from_text(str(res1)))
+                
+                # STEP 2: Geology
+                with st.spinner("2/3 Extracting Resources & Reserves..."):
+                    res2 = extraction_engine.query(prompt_geo)
+                    final_data.update(extract_json_from_text(str(res2)))
+                
+                # STEP 3: Economics
+                with st.spinner("3/3 Extracting Economics..."):
+                    res3 = extraction_engine.query(prompt_eco)
+                    final_data.update(extract_json_from_text(str(res3)))
+
+                # MERGE & DISPLAY
+                try:
+                    df = pd.json_normalize([final_data])
+                    st.session_state.last_data = df
+                    st.success("Deep Extraction Complete!")
+                    st.dataframe(df)
+                    st.session_state.messages.append({"role": "assistant", "content": "Deep Extraction Complete."})
+                except Exception as e:
+                    st.error(f"Merge Error: {e}")
+                    st.write(final_data)
+
+    # Chat Input
+    if prompt := st.chat_input("Ask specific questions..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -224,19 +176,11 @@ if st.session_state.index: # Check if index exists
                 st.markdown(str(response))
                 st.session_state.messages.append({"role": "assistant", "content": str(response)})
 
-    # Persistent Download Button
+    # Download
     if st.session_state.last_data is not None:
         st.divider()
         st.subheader("📥 Export")
-        
         output = BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             st.session_state.last_data.to_excel(writer, index=False, sheet_name='Summary')
-        excel_data = output.getvalue()
-
-        st.download_button(
-            label="Download Excel (.xlsx)",
-            data=excel_data,
-            file_name="mining_data_export.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        st.download_button("Download Excel (.xlsx)", output.getvalue(), "mining_data_export.xlsx")
