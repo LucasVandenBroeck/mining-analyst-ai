@@ -51,7 +51,7 @@ def extract_and_normalize_json(text):
         return df
         
     except Exception as e:
-        print(f"JSON Error: {e}")
+        # print(f"JSON Error: {e}") # Debugging
         return None
 
 # --- MAIN LOGIC ---
@@ -70,6 +70,8 @@ Settings.llm = llm
 uploaded_file = st.file_uploader("Upload Mining Report (PDF)", type=['pdf'])
 
 # Session State Initialization
+if "index" not in st.session_state:
+    st.session_state.index = None  # <--- FIX 1: Initialize index storage
 if "query_engine" not in st.session_state:
     st.session_state.query_engine = None
 if "messages" not in st.session_state:
@@ -90,9 +92,14 @@ if uploaded_file:
                 parser = LlamaParse(result_type="markdown", verbose=True, language="en")
                 file_extractor = {".pdf": parser}
                 documents = SimpleDirectoryReader(input_files=[tmp_file_path], file_extractor=file_extractor).load_data()
+                
+                # Create Index
                 index = VectorStoreIndex.from_documents(documents)
+                
+                # <--- FIX 2: Store the Index itself, not just the engine
+                st.session_state.index = index
 
-                # Base Prompt
+                # Create the standard Chat Engine (Lightweight)
                 base_prompt = (
                     "You are a Mining Analyst. Your goal is to extract structured data. "
                     "Always answer based strictly on the provided text."
@@ -100,7 +107,7 @@ if uploaded_file:
                 
                 st.session_state.query_engine = index.as_query_engine(
                     system_prompt=base_prompt,
-                    similarity_top_k=7  # Increased context window for full report scanning
+                    similarity_top_k=5
                 )
                 
                 st.session_state.last_uploaded = uploaded_file.name
@@ -111,7 +118,7 @@ if uploaded_file:
                 st.error(f"Error: {e}")
 
 # --- CHAT & EXPORT INTERFACE ---
-if st.session_state.query_engine:
+if st.session_state.index: # Check if index exists
 
     # Display History
     for message in st.session_state.messages:
@@ -119,7 +126,6 @@ if st.session_state.query_engine:
             st.markdown(message["content"])
 
     # --- THE GOLDEN PROMPT TEMPLATE ---
-    # We define the schema here to inject into the query
     json_structure_prompt = """
     Extract the project data into the following JSON schema.
     Return ONLY valid JSON inside ```json``` tags.
@@ -173,29 +179,26 @@ if st.session_state.query_engine:
     with col1:
         # The Main Extraction Button
         if st.button("🚀 Run Full Data Extraction"):
-            # 1. VISUAL FEEDBACK
             st.session_state.messages.append({"role": "user", "content": "Running Full Data Extraction..."})
             with st.chat_message("user"):
                 st.write("Running Full Data Extraction...")
 
-            # 2. THE FIX: Create a specialized engine just for this heavy task
-            # We increase 'similarity_top_k' to 20 to catch distributed data
-            # We use 'response_mode="tree_summarize"' to force it to combine all 20 chunks intelligently
-            extraction_engine = st.session_state.query_engine.index.as_query_engine(
-                system_prompt=json_structure_prompt,
-                similarity_top_k=20,     # <--- INCREASED from 7 to 20
-                response_mode="tree_summarize" # <--- NEW: Combines multiple chunks better
+            # <--- FIX 3: Use the stored INDEX to create a new heavy-duty engine
+            # This logic now works because st.session_state.index is valid
+            extraction_engine = st.session_state.index.as_query_engine(
+                similarity_top_k=20,     # Deep search
+                response_mode="tree_summarize" # Summarize all chunks
             )
 
-            # 3. GENERATE
             with st.chat_message("assistant"):
                 with st.spinner("Scanning 20+ key sections of the report... (This may take 30s)"):
                     
-                    # We send a very specific trigger phrase to matched the system prompt
-                    response = extraction_engine.query("Extract all project parameters into the defined JSON schema.")
+                    # We send a very specific trigger phrase combined with the schema
+                    query_text = f"Extract all project parameters. {json_structure_prompt}"
+                    
+                    response = extraction_engine.query(query_text)
                     response_text = str(response)
                     
-                    # 4. PARSE & DISPLAY
                     df = extract_and_normalize_json(response_text)
                     
                     if df is not None:
@@ -203,7 +206,6 @@ if st.session_state.query_engine:
                         st.success("Extraction Complete! (Checked 20 document segments)")
                         st.dataframe(df)
                         
-                        # Add success message to chat history
                         st.session_state.messages.append({"role": "assistant", "content": "Data Extracted Successfully. See the Download section below."})
                     else:
                         st.error("Extraction failed or returned invalid JSON.")
