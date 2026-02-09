@@ -11,128 +11,381 @@ from llama_parse import LlamaParse
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Mining Analyst Pro", layout="wide")
-st.title("⛏️ Mining Analyst Pro (Enterprise Extraction)")
+st.title("⛏️ Mining Analyst Pro (Enterprise Edition)")
 
 # --- SIDEBAR ---
 with st.sidebar:
     st.header("Configuration")
-    openai_key = st.text_input("OpenAI API Key", type="password")
-    llama_cloud_key = st.text_input("LlamaCloud API Key", type="password")
+    
+    # Load keys from secrets or environment
+    default_openai = os.environ.get("OPENAI_API_KEY", "")
+    default_llama = os.environ.get("LLAMA_CLOUD_API_KEY", "")
+
+    openai_key = st.text_input("OpenAI API Key", value=default_openai, type="password")
+    llama_cloud_key = st.text_input("LlamaCloud API Key", value=default_llama, type="password")
+    
     st.divider()
+    
     model_choice = st.selectbox("Select Model", ["gpt-4o", "gpt-4o-mini"])
     st.info("Tip: GPT-4o is required for this level of depth.")
 
-# --- THE 11-STEP SCHEMA CONFIGURATION ---
-# This dictionary controls the entire extraction logic.
-# Edit the 'prompt' here to change what the AI looks for.
+# --- THE MASTER SCHEMA (18 STEPS) ---
 SCHEMA_CONFIG = {
     "1_Identity": {
         "description": "Project Identity",
-        "prompt": "Extract project identity. Return JSON: { 'proj_name': '', 'company': '', 'prop_type': 'Exploration/Dev/Prod', 'loc_country': '', 'loc_province': '', 'dep_type': 'Porphyry/VMS/etc' }"
+        "prompt": """
+        Extract project identity. 
+        Return JSON: { 
+            'proj_name': '', 
+            'company': '', 
+            'prop_type': 'Exploration/Dev/Prod', 
+            'loc_country': '', 
+            'source_page': 'Page number where this is found' 
+        }
+        """
     },
     "2_Resources": {
-        "description": "Mineral Resources (M&I + Inferred)",
-        "prompt": "Extract Resource Totals. Return JSON: { 'res_total_tonnes_mi': 'Total M&I', 'res_grade_au_mi': null, 'res_grade_cu_mi': null, 'res_contained_au_oz': null, 'res_category': 'Measured+Indicated' }"
+        "description": "Mineral Resources",
+        "prompt": """
+        Locate the 'Mineral Resource Estimate' table. 
+        Focus on the 'Total Measured and Indicated' row (or 'M&I'). 
+        Extract the following:
+        - Tonnage (k tonnes or tonnes)
+        - Gold Grade (Au g/t)
+        - Contained Gold (oz)
+        If multiple cut-offs are shown, select the 'Base Case' or the highlighted row.
+        Return JSON: { 'res_total_tonnes': '', 'res_grade_au': '', 'source_table': '' }
+        """
     },
-    "3_Mining": {
-        "description": "Mining Method & Production",
-        "prompt": "Extract Mining Metrics. Return JSON: { 'mining_method': 'Open Pit/UG', 'strip_ratio': null, 'mining_rate_tpd': null, 'lom_years': null, 'avg_prod_au_pa': null }"
+    "3_Reserves": {
+        "description": "Mineral Reserves",
+        "prompt": """
+        Locate the 'Mineral Reserve Estimate' table. 
+        Focus on the 'Proven and Probable' totals. 
+        Extract:
+        - Tonnage (k tonnes or tonnes)
+        - Gold Grade (Au g/t)
+        - Contained Gold (oz)
+        Return JSON: { 'resv_total_tonnes': '', 'resv_grade_au': '', 'source_table': '' }
+        """
     },
-    "4_Metallurgy": {
-        "description": "Processing & Recovery",
-        "prompt": "Extract Metallurgy. Return JSON: { 'process_method': 'CIL/Flotation/Heap', 'recovery_au_pct': null, 'recovery_cu_pct': null, 'throughput_tpd': null, 'reagent_consumption': '' }"
+    "4_Mining": {
+        "description": "Mining Method",
+        "prompt": """
+        Extract Mining Metrics. 
+        Return JSON: { 
+            'mining_method': 'Open Pit/UG', 
+            'strip_ratio': null, 
+            'mining_rate_tpd': null, 
+            'source_context': 'Quote the sentence describing the method' 
+        }
+        """
     },
-    "5_Costs": {
-        "description": "Capex & Opex",
-        "prompt": "Extract Costs. Return JSON: { 'capex_initial_m': null, 'capex_sustaining_m': null, 'opex_mining_t': null, 'opex_process_t': null, 'opex_ga_t': null, 'aisc_oz': null }"
+    "5_Production": {
+        "description": "Production Profile",
+        "prompt": """
+        Locate the production schedule (often in 'Mining' or 'Economic Analysis').
+        Extract:
+        - Annual gold production (oz/year) for the first full year of commercial production.
+        - LOM average annual production (oz/year).
+        - Mine life (years).
+        Return JSON: { 
+            'prod_year1_oz': null,
+            'prod_lom_avg_oz': null,
+            'mine_life_years': null,
+            'source_table': ''
+        }
+        """
     },
-    "6_Economics": {
-        "description": "Economic Outputs (Base Case)",
-        "prompt": "Extract Base Case Economics. Return JSON: { 'price_assumed_au': null, 'discount_rate_pct': null, 'npv_post_tax_m': null, 'irr_post_tax_pct': null, 'payback_years': null }"
+    "6_Metallurgy": {
+        "description": "Processing",
+        "prompt": """
+        Extract Metallurgy. 
+        Return JSON: { 
+            'process_method': 'CIL/Flotation/Heap', 
+            'recovery_au_pct': null, 
+            'throughput_tpd': null, 
+            'source_page': 'page #'
+        }
+        """
     },
-    "7_Enviro": {
-        "description": "Environmental & Permitting",
-        "prompt": "Extract Environmental status. Return JSON: { 'permit_status': 'Approved/Pending', 'tailings_type': 'Dry Stack/Slurry', 'closure_cost_m': null, 'major_enviro_risk': '' }"
+    "7_Grades": {
+        "description": "Head Grades / Multi-Metal",
+        "prompt": """
+        Identify the section describing head grades or ROM grades. 
+        Extract grades for all relevant metals:
+        - Au (g/t)
+        - Ag (g/t)
+        - Cu (%)
+        - Any additional listed metal
+        Return JSON: {
+            'grade_au': null,
+            'grade_ag': null,
+            'grade_cu': null,
+            'other_grades': {},
+            'source_page': ''
+        }
+        """
     },
-    "8_Risks": {
-        "description": "Risks & Constraints",
-        "prompt": "Extract Key Risks. Return JSON: { 'risk_resource_confidence': '', 'risk_metallurgy': '', 'risk_infrastructure': '', 'risk_social_permitting': '' }"
+    "8_Recoveries": {
+        "description": "Metallurgical Recoveries",
+        "prompt": """
+        Find metallurgical testwork or processing sections.
+        Extract metal recoveries:
+        - Gold recovery (%)
+        - Silver recovery (%)
+        - Copper recovery (%)
+        Return JSON: {
+            'rec_au_pct': null,
+            'rec_ag_pct': null,
+            'rec_cu_pct': null,
+            'source_page': ''
+        }
+        """
     },
-    "9_Infra": {
+    "9_Costs": {
+        "description": "Capital Costs (Capex)",
+        "prompt": """
+        Locate the 'Capital Cost Summary' table (often Section 21).
+        Extract:
+        - 'Initial Capital' (or Pre-Production Capital).
+        - 'Sustaining Capital'.
+        - 'Total LOM Capital'.
+        Return JSON: { 'capex_initial_m': '', 'capex_sustaining_m': '', 'source_table': '' }
+        """
+    },
+    "10_Opex": {
+        "description": "Operating Costs (Opex)",
+        "prompt": """
+        Locate the operating cost breakdown.
+        Extract:
+        - Mining cost ($/t mined or $/t ore)
+        - Processing cost ($/t processed)
+        - G&A ($/t)
+        - Total operating cost ($/t)
+        Return JSON: {
+            'opex_mining_per_t': null,
+            'opex_processing_per_t': null,
+            'opex_ga_per_t': null,
+            'opex_total_per_t': null,
+            'source_table': ''
+        }
+        """
+    },
+    "11_AISC": {
+        "description": "All-in Sustaining Costs",
+        "prompt": """
+        Locate AISC values. 
+        Extract:
+        - AISC ($/oz)
+        - AISC breakdown if provided
+        Return JSON: {
+            'aisc_per_oz': null,
+            'aisc_breakdown': {},
+            'source_page': ''
+        }
+        """
+    },
+    "12_Economics": {
+        "description": "Base Case Economics",
+        "prompt": """
+        Extract Base Case Economics. 
+        Return JSON: { 
+            'price_assumed_au': null, 
+            'npv_post_tax_m': null, 
+            'irr_post_tax_pct': null, 
+            'payback_years': null, 
+            'source_page': 'Page #',
+            'confidence': 'High/Low (Low if you had to calculate it)' 
+        }
+        """
+    },
+    "13_Infrastructure": {
         "description": "Infrastructure",
-        "prompt": "Extract Infrastructure details. Return JSON: { 'power_source': 'Grid/Diesel/Hydro', 'water_source': '', 'access_road_rail': '', 'camp_requirements': '' }"
+        "prompt": """
+        Identify infrastructure statements.
+        Extract:
+        - Power source
+        - Water source
+        - Roads / access
+        - Nearby infrastructure (ports, rail)
+        Return JSON: {
+            'power_source': '',
+            'water_source': '',
+            'access_roads': '',
+            'infrastructure_notes': '',
+            'source_page': ''
+        }
+        """
     },
-    "10_QP": {
+    "14_Environment": {
+        "description": "Environmental",
+        "prompt": """
+        Extract environmental data:
+        - Tailings type (e.g., conventional, dry-stack)
+        - Water management issues
+        - Key environmental risks cited
+        Return JSON: {
+            'tailings_type': '',
+            'env_risks': '',
+            'water_mgmt': '',
+            'source_page': ''
+        }
+        """
+    },
+    "15_Permitting": {
+        "description": "Permitting Status",
+        "prompt": """
+        Identify permitting stage:
+        - Environmental permits
+        - Mining licence status
+        - Any pending approvals
+        Return JSON: {
+            'permit_status': '',
+            'critical_permits': '',
+            'source_page': ''
+        }
+        """
+    },
+    "16_Risks": {
+        "description": "Project Risks",
+        "prompt": """
+        Extract any explicit risk statements made by Qualified Persons:
+        - Geological risks
+        - Metallurgical risks
+        - Operational risks
+        - ESG or social risks
+        Return JSON: {
+            'geo_risks': '',
+            'meta_risks': '',
+            'operational_risks': '',
+            'esg_risks': '',
+            'source_context': ''
+        }
+        """
+    },
+    "17_QP": {
         "description": "Qualified Persons",
-        "prompt": "Extract QP Info. Return JSON: { 'qp_names': ['Name1', 'Name2'], 'qp_firms': ['Firm1'] }"
+        "prompt": """
+        Extract Qualified Person information:
+        - Name(s)
+        - Area of responsibility (geology, mining, metallurgy, economic analysis)
+        - Affiliation (consulting firm, independent QP, etc.)
+        Return JSON: {
+            'qp_list': [],
+            'source_page': ''
+        }
+        """
     },
-    "11_Compliance": {
-        "description": "Compliance & Dates",
-        "prompt": "Extract Report Details. Return JSON: { 'effective_date': '', 'filing_date': '', 'drill_meters_total': null }"
+    "18_Compliance": {
+        "description": "Compliance Details",
+        "prompt": """
+        Identify compliance information:
+        - Effective date of the report
+        - Report type (PFS, FS, PEA)
+        - Data sources and QA/QC notes
+        Return JSON: {
+            'effective_date': '',
+            'report_type': '',
+            'qa_qc_summary': '',
+            'source_page': ''
+        }
+        """
     }
 }
 
 # --- HELPER: ROBUST JSON PARSER ---
 def extract_json_from_text(text):
-    """Finds JSON objects { ... } in text, robust to conversational noise."""
+    """
+    Finds JSON objects { ... } in text, robust to conversational noise.
+    """
     try:
+        # Try to find text between ```json and ``` tags first
         match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
-        if match: text = match.group(1)
-        start, end = text.find('{'), text.rfind('}')
+        if match: 
+            text = match.group(1)
+            
+        # Locate the first '{' and the last '}'
+        start = text.find('{')
+        end = text.rfind('}')
+        
         if start != -1 and end != -1:
-            return json.loads(text[start:end+1])
+            json_str = text[start:end+1]
+            return json.loads(json_str)
         return {}
     except:
         return {}
 
-# --- MAIN LOGIC ---
+# --- MAIN APP LOGIC ---
 
 if not openai_key or not llama_cloud_key:
-    st.warning("Please enter API Keys.")
+    st.warning("Please enter your API Keys in the sidebar to proceed.")
     st.stop()
 
 os.environ["OPENAI_API_KEY"] = openai_key
 os.environ["LLAMA_CLOUD_API_KEY"] = llama_cloud_key
-Settings.llm = OpenAI(model=model_choice, temperature=0)
 
-# File Upload
+llm = OpenAI(model=model_choice, temperature=0)
+Settings.llm = llm
+
+# --- FILE UPLOAD ---
 uploaded_file = st.file_uploader("Upload Mining Report (PDF)", type=['pdf'])
 
-if "index" not in st.session_state: st.session_state.index = None
-if "last_data" not in st.session_state: st.session_state.last_data = None
+if "index" not in st.session_state:
+    st.session_state.index = None
+if "last_data" not in st.session_state:
+    st.session_state.last_data = None
 
 if uploaded_file:
     if "last_uploaded" not in st.session_state or st.session_state.last_uploaded != uploaded_file.name:
-        with st.spinner(f"Indexing {uploaded_file.name}..."):
+        with st.spinner(f"Indexing {uploaded_file.name}... (This may take a minute)"):
             try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                    tmp.write(uploaded_file.read())
-                    tmp_path = tmp.name
-                
-                # Instruction for LlamaParse to focus on tables
-                parser = LlamaParse(result_type="markdown", verbose=True, language="en")
-                docs = SimpleDirectoryReader(input_files=[tmp_path], file_extractor={".pdf": parser}).load_data()
-                st.session_state.index = VectorStoreIndex.from_documents(docs)
-                st.session_state.last_uploaded = uploaded_file.name
-                st.success("Report Indexed!")
-                os.remove(tmp_path)
-            except Exception as e:
-                st.error(f"Error: {e}")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                    tmp_file.write(uploaded_file.read())
+                    tmp_file_path = tmp_file.name
 
-# --- EXECUTION INTERFACE ---
+                # LlamaParse Configuration
+                parser = LlamaParse(
+                    result_type="markdown", 
+                    verbose=True, 
+                    language="en",
+                    parsing_instruction="Extract tables containing Resources, Reserves, Economics, and Costs."
+                )
+                
+                file_extractor = {".pdf": parser}
+                documents = SimpleDirectoryReader(input_files=[tmp_file_path], file_extractor=file_extractor).load_data()
+                
+                # Build Index
+                st.session_state.index = VectorStoreIndex.from_documents(documents)
+                st.session_state.last_uploaded = uploaded_file.name
+                st.success("Report Indexed Successfully!")
+                
+                # Cleanup
+                os.remove(tmp_file_path)
+
+            except Exception as e:
+                st.error(f"Error during indexing: {e}")
+
+# --- EXTRACTION INTERFACE ---
 if st.session_state.index:
     
     col1, col2 = st.columns([3, 1])
     with col1:
-        if st.button("🚀 Run 11-Step Deep Extraction"):
+        st.write(f"**Ready to analyze:** {st.session_state.last_uploaded}")
+        
+        if st.button("🚀 Run Full 18-Step Extraction"):
             
-            # Setup
-            engine = st.session_state.index.as_query_engine(similarity_top_k=10, response_mode="tree_summarize")
+            # Initialize Engine
+            engine = st.session_state.index.as_query_engine(
+                similarity_top_k=8,  # Balanced for speed/accuracy
+                response_mode="tree_summarize"
+            )
+            
             master_data = {}
             progress_bar = st.progress(0)
             status_text = st.empty()
             
-            # THE LOOP: Iterate through the SCHEMA_CONFIG
+            # ITERATE THROUGH SCHEMA
             total_steps = len(SCHEMA_CONFIG)
             
             for i, (key, config) in enumerate(SCHEMA_CONFIG.items()):
@@ -141,34 +394,46 @@ if st.session_state.index:
                 status_text.markdown(f"**Step {step_num}/{total_steps}:** Analyzing {config['description']}...")
                 progress_bar.progress(int((step_num / total_steps) * 100))
                 
-                # Run Query
-                # We append "Return ONLY valid JSON" to ensure compliance
-                full_prompt = f"{config['prompt']} Return ONLY valid JSON."
-                response = engine.query(full_prompt)
-                
-                # Extract Data
-                data = extract_json_from_text(str(response))
-                if data:
-                    master_data.update(data) # Merge into master dict
-                else:
-                    print(f"Failed on {key}") # Debug in terminal
+                # Query AI
+                try:
+                    full_prompt = f"{config['prompt']} Return ONLY valid JSON."
+                    response = engine.query(full_prompt)
+                    
+                    # Parse Data
+                    data = extract_json_from_text(str(response))
+                    if data:
+                        master_data.update(data)
+                        print(f"✅ {key} Success") # Logs to terminal
+                    else:
+                        print(f"⚠️ {key} Returned Empty")
+                        
+                except Exception as e:
+                    print(f"❌ Error on {key}: {e}")
             
-            # Finalize
-            status_text.markdown("✅ **Extraction Complete!**")
-            progress_bar.empty()
+            # Finish
+            progress_bar.progress(100)
+            status_text.markdown("✅ **Analysis Complete!**")
             
-            # Display & Save
             if master_data:
+                # Flatten and display
                 df = pd.json_normalize([master_data])
                 st.session_state.last_data = df
                 st.dataframe(df)
             else:
-                st.error("Extraction failed. No data found.")
+                st.error("Extraction failed. Please check the logs.")
 
-    # Download
+    # Download Button
     if st.session_state.last_data is not None:
         st.divider()
+        st.subheader("📥 Export Results")
+        
         output = BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            st.session_state.last_data.to_excel(writer, index=False, sheet_name='Deep_Dive')
-        st.download_button("Download Full Analysis (.xlsx)", output.getvalue(), "mining_deep_dive.xlsx")
+            st.session_state.last_data.to_excel(writer, index=False, sheet_name='Deep_Analysis')
+        
+        st.download_button(
+            label="Download Full Excel Report (.xlsx)",
+            data=output.getvalue(),
+            file_name="mining_deep_dive_export.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
