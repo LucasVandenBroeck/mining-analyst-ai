@@ -11,23 +11,40 @@ from llama_parse import LlamaParse
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Mining Analyst Pro", layout="wide")
-st.title("⛏️ Mining Analyst Pro (Enterprise Edition)")
+st.title("⛏️ Mining Analyst - NI 43-101 Deep Dive")
 
-# --- SIDEBAR ---
+# --- SIDEBAR: CONFIGURATION ---
 with st.sidebar:
-    st.header("Configuration")
+    st.header("Configuratie")
     
-    # Load keys from secrets or environment
-    default_openai = os.environ.get("OPENAI_API_KEY", "")
-    default_llama = os.environ.get("LLAMA_CLOUD_API_KEY", "")
+    # 1. Probeer keys uit Streamlit Secrets te halen
+    try:
+        openai_key = st.secrets["OPENAI_API_KEY"]
+        st.success("✅ OpenAI Key geladen uit veilige opslag")
+    except (FileNotFoundError, KeyError):
+        # Als ze niet in secrets staan, vraag erom (voor manueel gebruik)
+        openai_key = st.text_input("OpenAI API Key", type="password")
 
-    openai_key = st.text_input("OpenAI API Key", value=default_openai, type="password")
-    llama_cloud_key = st.text_input("LlamaCloud API Key", value=default_llama, type="password")
+    try:
+        llama_cloud_key = st.secrets["LLAMA_CLOUD_API_KEY"]
+        st.success("✅ LlamaCloud Key geladen uit veilige opslag")
+    except (FileNotFoundError, KeyError):
+        llama_cloud_key = st.text_input("LlamaCloud API Key", type="password")
     
     st.divider()
     
     model_choice = st.selectbox("Select Model", ["gpt-4o", "gpt-4o-mini"])
-    st.info("Tip: GPT-4o is required for this level of depth.")
+    if model_choice == "gpt-4o":
+        st.info("Tip: GPT-4o wordt aanbevolen voor complexe tabellen.")
+
+# --- API SETUP ---
+if not openai_key or not llama_cloud_key:
+    st.warning("Voer je API keys in om te beginnen.")
+    st.stop()
+
+# Zet de keys in de omgeving zodat LlamaIndex ze kan vinden
+os.environ["OPENAI_API_KEY"] = openai_key
+os.environ["LLAMA_CLOUD_API_KEY"] = llama_cloud_key
 
 # --- THE MASTER SCHEMA (18 STEPS) ---
 SCHEMA_CONFIG = {
